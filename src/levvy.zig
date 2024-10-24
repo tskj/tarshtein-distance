@@ -1,10 +1,10 @@
 const std = @import("std");
 
 export fn fuzzy_search(query: [*]const u8, number_of_lines: c_uint, input: [*][*]const u8, output: [*]u16) callconv(.C) c_int {
-    var q_len: usize = 0;
+    var q_len: u16 = 0;
     while (query[q_len] != 0) : (q_len += 1) {}
 
-    var longest_line_length: usize = 0;
+    var longest_line_length: u16 = 0;
     for (input, 0..number_of_lines) |line, index| {
         var l_len: u16 = 0;
         while (line[l_len] != 0) : (l_len += 1) {}
@@ -26,9 +26,9 @@ export fn fuzzy_search(query: [*]const u8, number_of_lines: c_uint, input: [*][*
     buffer[1] = 20;
     buffer[2] = 30;
 
-    output[0] = 100;
-    output[1] = 101;
-    output[2] = 102;
+    output[0] = q_len;
+    output[1] = longest_line_length;
+    output[2] = @as(u16, @intCast(number_of_lines));
 
     return 0;
 }
