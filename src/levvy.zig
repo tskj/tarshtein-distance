@@ -1,6 +1,6 @@
 const std = @import("std");
 
-export fn fuzzy_search(query: [*]const u8, number_of_lines: c_uint, input: [*][*]const u8, output: [*]u16) callconv(.C) c_int {
+export fn fuzzy_search(query: [*:0]const u8, number_of_lines: c_uint, input: [*][*:0]const u8, output: [*]u16) callconv(.C) c_int {
     var q_len: u16 = 0;
     while (query[q_len] != 0) : (q_len += 1) {}
 
