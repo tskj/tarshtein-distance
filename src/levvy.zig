@@ -21,14 +21,15 @@ export fn fuzzy_search(query: [*:0]const u8, number_of_lines: c_uint, input: [*]
     defer allocator.free(buffer);
 
     // testing
-    buffer[0] = 10;
-    buffer[1] = 20;
-    buffer[2] = 30;
+    buffer[0] = 100;
+    buffer[1] = 200;
+    buffer[2] = 300;
 
     // testing
     output[0] = q_len;
     output[1] = longest_line_length;
     output[2] = @as(u16, @intCast(number_of_lines));
+    output[3] = 1007;
 
     return 0; // probably want to return best (lowest) distance
 }

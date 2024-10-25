@@ -12,9 +12,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Install `levvy.dll` to the specified directory
-    const output_dir = "C:\\Users\\tarje\\AppData\\Local\\nvim\\zig\\levvy";
-    const copy_step = b.addInstallFile(zig_mod.getEmittedBin(), output_dir ++ "\\levvy.dll");
+    // Define relative path for installation
+    const copy_step = b.addInstallFile(zig_mod.getEmittedBin(), "lib/levvy.dll");
 
     // Make the built-in install step depend on the copy step
     b.getInstallStep().dependOn(&copy_step.step);
