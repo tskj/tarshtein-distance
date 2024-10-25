@@ -1,5 +1,15 @@
 const std = @import("std");
 
+fn compute_distance(q: [*:0]const u8, q_len: u16, h: [*:0]const u8, h_len: u16, padding: u16, dp_curr: []u16, dp_prev: []u16) u16 {
+    _ = dp_curr;
+    _ = dp_prev;
+    _ = h_len;
+    _ = q_len;
+    _ = q;
+    _ = h;
+    return padding;
+}
+
 export fn fuzzy_search(query: [*:0]const u8, number_of_lines: c_uint, input: [*][*:0]const u8, output: [*]u16) callconv(.C) c_int {
     const q_len: u16 = @as(u16, @intCast(std.mem.len(query)));
 
@@ -15,23 +25,24 @@ export fn fuzzy_search(query: [*:0]const u8, number_of_lines: c_uint, input: [*]
     const memory_requirement = longest_line_length * 2 * 2;
 
     const allocator = std.heap.page_allocator;
-    var buffer = allocator.alloc(u16, memory_requirement) catch {
+    const buffer = allocator.alloc(u16, memory_requirement) catch {
         return -1;
     };
     defer allocator.free(buffer);
 
-    // testing
-    buffer[0] = 100;
-    buffer[1] = 200;
-    buffer[2] = 300;
+    const half = memory_requirement / 2;
+    const dp_curr = buffer[0..half];
+    const dp_prev = buffer[half..];
 
-    // testing
-    output[0] = q_len;
-    output[1] = longest_line_length;
-    output[2] = @as(u16, @intCast(number_of_lines));
-    output[3] = 1007;
+    var shortest_dist: ?u16 = null;
+    for (0..number_of_lines) |i| {
+        const d = compute_distance(query, q_len, input[i], output[i], longest_line_length - output[i], dp_curr, dp_prev);
+        output[i] = d;
+        if (shortest_dist == null or d < shortest_dist.?) shortest_dist = d;
+    }
 
-    return 0; // probably want to return best (lowest) distance
+    if (shortest_dist == null) return -1;
+    return @as(c_int, @intCast(shortest_dist.?));
 }
 
 test "simple test" {
