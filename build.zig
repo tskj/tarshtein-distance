@@ -10,6 +10,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/levvy.zig"),
         .target = target,
         .optimize = optimize,
+        // .optimize = .ReleaseFast,
     });
 
     // Define relative path for installation

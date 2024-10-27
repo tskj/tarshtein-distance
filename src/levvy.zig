@@ -49,7 +49,7 @@ fn compute_distance(q: [*]const u8, q_len: u16, h: [*]const u8, h_len: u16, padd
     const H: u16 = h_len + 1;
     const B: u16 = 2;
     const padding_cost: u16 = padding * skip_cost;
-    const bias: u16 = q_len * streak_bias; // stops distance going negative
+    const bias: u16 = @min(q_len, h_len) * streak_bias; // stops distance going negative
 
     // base case
     var h_i: u16 = 0;
@@ -108,7 +108,9 @@ fn compute_distance(q: [*]const u8, q_len: u16, h: [*]const u8, h_len: u16, padd
         dp_prev = tmp;
     }
 
-    return dp_prev[0];
+    // if we could have a bias we need to remove one
+    // because the first character can't start in a streak
+    return dp_prev[0] - if (bias > 0) streak_bias else 0;
 }
 
 test "simple test" {
