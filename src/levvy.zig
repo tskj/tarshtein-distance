@@ -7,7 +7,7 @@ const streak_bias: u16 = 3;
 
 const case_setting = 1;
 
-export fn fuzzy_search(query: [*:0]const u8, number_of_lines: c_uint, input: [*][*:0]const u8, output: [*]u16) callconv(.C) c_int {
+export fn fuzzy_search(query: [*:0]const u8, number_of_lines: c_uint, input: [*]const [*:0]const u8, output: [*]u16) callconv(.C) c_int {
     const q_len: u16 = @as(u16, @intCast(std.mem.len(query)));
 
     var longest_line_length: u16 = 0;
@@ -121,38 +121,37 @@ test "simple test" {
 }
 
 test "fuzzy_search simple test" {
-    // const query: [*:0]const u8 = "hello";
-    // const number_of_lines: c_uint = 4;
-    // const input_strings = [_][*:0]const u8{
-    //     "hello",
-    //     "world",
-    //     "hell",
-    //     "help",
-    // };
-    // var outputs = [_]u16{ 0, 0, 0, 0 };
+    const query: [*:0]const u8 = "hello";
+    const number_of_lines: c_uint = 6;
+    const input_strings = [_][*:0]const u8{
+        "hello",
+        "world",
+        "hell",
+        "help",
+        "hel",
+        "hel__",
+    };
+    var outputs = [_]u16{ 0, 0, 0, 0, 0, 0 };
 
-    // // Create a pointer to the array of C strings
-    // // const inputs = &
+    // Call the fuzzy_search function with the test data
+    const result = fuzzy_search(query, number_of_lines, input_strings[0..].ptr, &outputs);
 
-    // // Call the fuzzy_search function with the test data
-    // const result = fuzzy_search(query, number_of_lines, input_strings, &outputs);
+    // Ensure the function did not return an error
+    try std.testing.expect(result >= 0);
 
-    // // Ensure the function did not return an error
-    // try std.testing.expect(result >= 0);
+    // Check that the shortest distance is as expected
+    try std.testing.expectEqual(@as(c_int, 0), result);
 
-    // // Check that the shortest distance is as expected
-    // try std.testing.expectEqual(@as(c_int, 0), result);
+    // Validate the distances computed for each input string
+    try std.testing.expectEqual(@as(u16, 0), outputs[0]); // "hello" vs "hello"
+    try std.testing.expect(outputs[1] > 0); // "hello" vs "world"
+    try std.testing.expect(outputs[2] > 0); // "hello" vs "hell"
+    try std.testing.expect(outputs[3] > 0); // "hello" vs "help"
 
-    // // Validate the distances computed for each input string
-    // try std.testing.expectEqual(@as(u16, 0), outputs[0]); // "hello" vs "hello"
-    // try std.testing.expect(outputs[1] > 0); // "hello" vs "world"
-    // try std.testing.expect(outputs[2] > 0); // "hello" vs "hell"
-    // try std.testing.expect(outputs[3] > 0); // "hello" vs "help"
-
-    // // Optionally, print the distances for manual verification
-    // std.debug.print("Shortest distance: {d}\n", .{result});
-    // for (number_of_lines) |index| {
-    //     const input = input_strings[index][0 .. std.mem.len(input_strings[index]) - 1]; // Remove null terminator for printing
-    //     std.debug.print("Distance between '{s}' and '{s}': {d}\n", .{ query[0 .. std.mem.len(query) - 1], input, outputs[index] });
-    // }
+    // Optionally, print the distances for manual verification
+    std.debug.print("Shortest distance: {d}\n", .{result});
+    for (0..number_of_lines) |index| {
+        const input = input_strings[index][0..std.mem.len(input_strings[index])];
+        std.debug.print("Distance between '{s}' and '{s}': {d}\n", .{ query[0..std.mem.len(query)], input, outputs[index] });
+    }
 }
