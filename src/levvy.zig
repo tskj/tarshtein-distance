@@ -731,32 +731,16 @@ threadlocal var score_planes_ready: bool = false;
 threadlocal var score_exact: [score_max_line + simd_width]u8 = undefined;
 threadlocal var score_lower: [score_max_line + simd_width]u8 = undefined;
 
+// scores a single line against the query. no match/no-match gate: every
+// line gets a real levvy distance and the caller ranks by it (a poor match
+// simply gets a large distance and sinks). this is the whole point of the
+// algorithm -- a one-character typo is a cheap substitution, not a rejection,
+// so it still ranks near the top rather than disappearing.
 pub export fn levvy_score(query: [*:0]const u8, line: [*:0]const u8, pad_to: c_uint) callconv(.c) c_int {
     const q_len_full = std.mem.len(query);
     const h_len_full = std.mem.len(line);
 
-    // smart-case subsequence prefilter; also the cheap common path while
-    // typing, since most entries stop matching after a few characters
-    {
-        var q_i: usize = 0;
-        var h_i: usize = 0;
-        while (q_i < q_len_full and h_i < h_len_full) {
-            var a = query[q_i];
-            var b = line[h_i];
-            if (case_setting == 2) {
-                if ('A' <= a and a <= 'Z') a |= 32;
-                if ('A' <= b and b <= 'Z') b |= 32;
-            } else if (case_setting == 1 and 'a' <= a and a <= 'z') {
-                if ('A' <= b and b <= 'Z') b |= 32;
-            }
-            if (a == b) q_i += 1;
-            h_i += 1;
-        }
-        if (q_i < q_len_full) return -1;
-    }
-
-    // very long lines are scored on their prefix (the subsequence check
-    // above already ran on the whole line)
+    // very long lines are scored on their prefix
     const h_len: u16 = @intCast(@min(h_len_full, score_max_line));
     const q_len: u16 = @intCast(@min(q_len_full, score_max_line));
 
@@ -930,23 +914,13 @@ fn walk_positions(q: [*]const u8, q_len: u16, h: [*]const u8, h_len: u16, dp: []
 }
 
 // returns the number of match positions written to out (0-based byte
-// offsets into line, strictly increasing, at most min(out_cap, #query)),
-// or -1 when the query doesn't match the line at all
+// offsets into line, strictly increasing, at most min(out_cap, #query)).
+// no gate: highlights whatever the optimal path actually matched, which
+// may be nothing (returns 0) for an unrelated line -- consistent with
+// levvy_score scoring every line rather than rejecting.
 pub export fn levvy_positions(query: [*:0]const u8, line: [*:0]const u8, out: [*]u16, out_cap: c_uint) callconv(.c) c_int {
     const q_len_full = std.mem.len(query);
     const h_len_full = std.mem.len(line);
-
-    // same smart-case subsequence gate as levvy_score
-    {
-        var q_i: usize = 0;
-        var h_i: usize = 0;
-        while (q_i < q_len_full and h_i < h_len_full) {
-            const pair = adjusted_chars(query[q_i], line[h_i]);
-            if (pair[0] == pair[1]) q_i += 1;
-            h_i += 1;
-        }
-        if (q_i < q_len_full) return -1;
-    }
 
     const q_len: u16 = @intCast(@min(q_len_full, score_max_line));
     const h_len: u16 = @intCast(@min(h_len_full, score_max_line));
@@ -1258,7 +1232,7 @@ test "handle api: agrees with fuzzy_search, reused across queries and thread cou
     }
 }
 
-test "levvy_score: subsequence matches score like the batch impl, others are -1" {
+test "levvy_score: always equals the batch distance (no gate, every line scored)" {
     var prng = std.Random.DefaultPrng.init(52);
     const r = prng.random();
     var hbuf: [max_test_len:0]u8 = undefined;
@@ -1266,14 +1240,12 @@ test "levvy_score: subsequence matches score like the batch impl, others are -1"
     const pool = "abcDEfgH_./ 12";
     const pad_to: u16 = 128;
 
-    var matches: usize = 0;
-    var rejects: usize = 0;
-    for (0..500) |_| {
+    for (0..1000) |_| {
         const h_len = r.intRangeAtMost(usize, 0, 60);
         for (hbuf[0..h_len]) |*c| c.* = pool[r.intRangeAtMost(usize, 0, pool.len - 1)];
         hbuf[h_len] = 0;
 
-        // half the time draw a real subsequence, half the time random junk
+        // subsequence half the time, random junk (typos, unrelated) the rest
         var q_len: usize = 0;
         if (r.boolean()) {
             var h_i: usize = 0;
@@ -1290,54 +1262,40 @@ test "levvy_score: subsequence matches score like the batch impl, others are -1"
         qbuf[q_len] = 0;
 
         const got = levvy_score(qbuf[0..q_len :0], hbuf[0..h_len :0], pad_to);
-        // reference: exact-case subsequence check (queries here contain
-        // uppercase only when copied from h, so smart case degenerates fine)
-        var qi: usize = 0;
-        var hi: usize = 0;
-        while (qi < q_len and hi < h_len) : (hi += 1) {
-            var a = qbuf[qi];
-            var b = hbuf[hi];
-            if (case_setting == 1 and 'a' <= a and a <= 'z') {
-                if ('A' <= b and b <= 'Z') b |= 32;
-            }
-            _ = &a;
-            if (a == b) qi += 1;
-        }
-        const is_subsequence = qi == q_len;
-
-        if (is_subsequence) {
-            const padding: u16 = @intCast(pad_to - @min(h_len, pad_to));
-            try std.testing.expectEqual(
-                @as(c_int, @intCast(test_distance(qbuf[0..q_len], hbuf[0..h_len], padding))),
-                got,
-            );
-            matches += 1;
-        } else {
-            try std.testing.expectEqual(@as(c_int, -1), got);
-            rejects += 1;
-        }
+        const padding: u16 = @intCast(pad_to - @min(h_len, pad_to));
+        // every line, subsequence or not, gets exactly the batch distance
+        try std.testing.expectEqual(
+            @as(c_int, @intCast(test_distance(qbuf[0..q_len], hbuf[0..h_len], padding))),
+            got,
+        );
     }
-    // make sure the generator exercised both sides
-    try std.testing.expect(matches > 50);
-    try std.testing.expect(rejects > 50);
 }
 
-test "levvy_score: ranking sanity for a picker" {
-    // contiguous filename match beats scattered path match, and non-matches
-    // are rejected regardless of case
+test "levvy_score: ranking sanity for a picker (typos rank near, not rejected)" {
+    // contiguous filename match beats scattered path match
     const q = "keymaps";
     const good = levvy_score(q, "plugin/keymaps.lua", 256);
     const scattered = levvy_score(q, "plugin/custom/key-map-something.lua", 256);
-    const miss = levvy_score(q, "plugin/colorscheme.lua", 256);
+    const unrelated = levvy_score(q, "plugin/colorscheme.lua", 256);
     try std.testing.expect(good >= 0);
-    try std.testing.expect(scattered >= 0);
     try std.testing.expect(good < scattered);
-    try std.testing.expectEqual(@as(c_int, -1), miss);
+    // an unrelated file isn't rejected -- it just scores worse and sinks
+    try std.testing.expect(unrelated >= 0);
+    try std.testing.expect(good < unrelated);
+
+    // the motivating case: a one-character typo (grayvendel vs graywendel)
+    // must score close to the exact match, and far better than an unrelated
+    // file -- a substitution, not a rejection
+    const exact = levvy_score("graywendel", "graywendel_migration.sql", 256);
+    const typo = levvy_score("grayvendel", "graywendel_migration.sql", 256);
+    const nope = levvy_score("grayvendel", "plugin/colorscheme.lua", 256);
+    try std.testing.expect(typo >= 0);
+    try std.testing.expect(typo > exact); // the typo costs something...
+    try std.testing.expect(typo < exact + 5 * sub_cost); // ...but not much
+    try std.testing.expect(typo < nope); // and ranks well above an unrelated file
 
     // smart case: lowercase query matches uppercase line
     try std.testing.expect(levvy_score("readme", "README.md", 256) >= 0);
-    // but uppercase query requires uppercase
-    try std.testing.expectEqual(@as(c_int, -1), levvy_score("XYZ", "xyz", 256));
 }
 
 test "positions: exact substring highlights the contiguous range" {
@@ -1351,8 +1309,8 @@ test "positions: exact substring highlights the contiguous range" {
     try std.testing.expectEqual(@as(c_int, 7), n2);
     try std.testing.expectEqualSlices(u16, &.{ 7, 8, 9, 10, 11, 12, 13 }, out[0..7]);
 
-    // no match
-    try std.testing.expectEqual(@as(c_int, -1), levvy_positions("zzz", "abc", &out, out.len));
+    // unrelated line: nothing matched, so zero highlight positions (not -1)
+    try std.testing.expectEqual(@as(c_int, 0), levvy_positions("zzz", "abc", &out, out.len));
     // empty query
     try std.testing.expectEqual(@as(c_int, 0), levvy_positions("", "abc", &out, out.len));
 }
