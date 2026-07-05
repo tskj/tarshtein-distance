@@ -709,6 +709,95 @@ pub export fn levvy_search(handle: ?*anyopaque, query: [*:0]const u8, output: [*
     return @as(c_int, @intCast(shortest));
 }
 
+// -- single-line scorer for streaming sorters (telescope et al) --
+//
+// telescope scores entries one at a time as they stream in, so the batch
+// handle api doesn't fit; this entry point scores a single line with
+// zero allocation (thread-local scratch). semantics tailored to pickers:
+//
+//   - returns -1 when the query is not a smart-case subsequence of the
+//     line ("doesn't match", the caller should discard the entry) --
+//     note a non-match stays a non-match for any extension of the query,
+//     which is exactly the invariant telescope's discard-caching assumes
+//   - otherwise returns the levvy distance with the line padded to
+//     `pad_to` columns, so scores are length-normalized and comparable
+//     across lines without knowing the longest line up front
+
+const score_max_line = 2048;
+const score_plane_len = score_max_line + 1 + simd_width;
+
+threadlocal var score_planes: [4 * score_plane_len]u16 = undefined;
+threadlocal var score_planes_ready: bool = false;
+threadlocal var score_exact: [score_max_line + simd_width]u8 = undefined;
+threadlocal var score_lower: [score_max_line + simd_width]u8 = undefined;
+
+pub export fn levvy_score(query: [*:0]const u8, line: [*:0]const u8, pad_to: c_uint) callconv(.c) c_int {
+    const q_len_full = std.mem.len(query);
+    const h_len_full = std.mem.len(line);
+
+    // smart-case subsequence prefilter; also the cheap common path while
+    // typing, since most entries stop matching after a few characters
+    {
+        var q_i: usize = 0;
+        var h_i: usize = 0;
+        while (q_i < q_len_full and h_i < h_len_full) {
+            var a = query[q_i];
+            var b = line[h_i];
+            if (case_setting == 2) {
+                if ('A' <= a and a <= 'Z') a |= 32;
+                if ('A' <= b and b <= 'Z') b |= 32;
+            } else if (case_setting == 1 and 'a' <= a and a <= 'z') {
+                if ('A' <= b and b <= 'Z') b |= 32;
+            }
+            if (a == b) q_i += 1;
+            h_i += 1;
+        }
+        if (q_i < q_len_full) return -1;
+    }
+
+    // very long lines are scored on their prefix (the subsequence check
+    // above already ran on the whole line)
+    const h_len: u16 = @intCast(@min(h_len_full, score_max_line));
+    const q_len: u16 = @intCast(@min(q_len_full, score_max_line));
+
+    if (!score_planes_ready) {
+        @memset(&score_planes, 0xffff);
+        score_planes_ready = true;
+    }
+
+    // same slack hygiene as the batch drivers: previous (longer) lines
+    // leave real values past this line's h_len
+    const wipe_start = @as(usize, h_len) + 1;
+    for (0..4) |p| {
+        const plane = score_planes[p * score_plane_len ..][0..score_plane_len];
+        @memset(plane[wipe_start..@min(score_plane_len, wipe_start + simd_width)], 0xffff);
+    }
+
+    for (0..h_len) |j| {
+        const c = line[j];
+        score_exact[j] = c;
+        score_lower[j] = if ('A' <= c and c <= 'Z') c | 32 else c;
+    }
+    @memset(score_exact[h_len..][0..simd_width], 0);
+    @memset(score_lower[h_len..][0..simd_width], 0);
+
+    const padding: u16 = if (pad_to > h_len) @intCast(@min(pad_to - h_len, 4096)) else 0;
+
+    const d = compute_distance_simd_scan(
+        query,
+        q_len,
+        score_exact[0 .. @as(usize, h_len) + simd_width],
+        score_lower[0 .. @as(usize, h_len) + simd_width],
+        h_len,
+        padding,
+        score_planes[0 * score_plane_len ..][0..score_plane_len],
+        score_planes[1 * score_plane_len ..][0..score_plane_len],
+        score_planes[2 * score_plane_len ..][0..score_plane_len],
+        score_planes[3 * score_plane_len ..][0..score_plane_len],
+    );
+    return @as(c_int, @intCast(d));
+}
+
 test "simple test" {
     var list: std.ArrayList(i32) = .empty;
     defer list.deinit(std.testing.allocator); // try commenting this out and see if zig detects the memory leak!
@@ -1004,6 +1093,88 @@ test "handle api: agrees with fuzzy_search, reused across queries and thread cou
         try std.testing.expectEqualSlices(u16, &out_ref, &out_auto);
         try std.testing.expectEqualSlices(u16, &out_ref, &out_many);
     }
+}
+
+test "levvy_score: subsequence matches score like the batch impl, others are -1" {
+    var prng = std.Random.DefaultPrng.init(52);
+    const r = prng.random();
+    var hbuf: [max_test_len:0]u8 = undefined;
+    var qbuf: [max_test_len:0]u8 = undefined;
+    const pool = "abcDEfgH_./ 12";
+    const pad_to: u16 = 128;
+
+    var matches: usize = 0;
+    var rejects: usize = 0;
+    for (0..500) |_| {
+        const h_len = r.intRangeAtMost(usize, 0, 60);
+        for (hbuf[0..h_len]) |*c| c.* = pool[r.intRangeAtMost(usize, 0, pool.len - 1)];
+        hbuf[h_len] = 0;
+
+        // half the time draw a real subsequence, half the time random junk
+        var q_len: usize = 0;
+        if (r.boolean()) {
+            var h_i: usize = 0;
+            while (h_i < h_len) : (h_i += 1) {
+                if (r.boolean() and q_len < 12) {
+                    qbuf[q_len] = hbuf[h_i];
+                    q_len += 1;
+                }
+            }
+        } else {
+            q_len = r.intRangeAtMost(usize, 0, 10);
+            for (qbuf[0..q_len]) |*c| c.* = pool[r.intRangeAtMost(usize, 0, pool.len - 1)];
+        }
+        qbuf[q_len] = 0;
+
+        const got = levvy_score(qbuf[0..q_len :0], hbuf[0..h_len :0], pad_to);
+        // reference: exact-case subsequence check (queries here contain
+        // uppercase only when copied from h, so smart case degenerates fine)
+        var qi: usize = 0;
+        var hi: usize = 0;
+        while (qi < q_len and hi < h_len) : (hi += 1) {
+            var a = qbuf[qi];
+            var b = hbuf[hi];
+            if (case_setting == 1 and 'a' <= a and a <= 'z') {
+                if ('A' <= b and b <= 'Z') b |= 32;
+            }
+            _ = &a;
+            if (a == b) qi += 1;
+        }
+        const is_subsequence = qi == q_len;
+
+        if (is_subsequence) {
+            const padding: u16 = @intCast(pad_to - @min(h_len, pad_to));
+            try std.testing.expectEqual(
+                @as(c_int, @intCast(test_distance(qbuf[0..q_len], hbuf[0..h_len], padding))),
+                got,
+            );
+            matches += 1;
+        } else {
+            try std.testing.expectEqual(@as(c_int, -1), got);
+            rejects += 1;
+        }
+    }
+    // make sure the generator exercised both sides
+    try std.testing.expect(matches > 50);
+    try std.testing.expect(rejects > 50);
+}
+
+test "levvy_score: ranking sanity for a picker" {
+    // contiguous filename match beats scattered path match, and non-matches
+    // are rejected regardless of case
+    const q = "keymaps";
+    const good = levvy_score(q, "plugin/keymaps.lua", 256);
+    const scattered = levvy_score(q, "plugin/custom/key-map-something.lua", 256);
+    const miss = levvy_score(q, "plugin/colorscheme.lua", 256);
+    try std.testing.expect(good >= 0);
+    try std.testing.expect(scattered >= 0);
+    try std.testing.expect(good < scattered);
+    try std.testing.expectEqual(@as(c_int, -1), miss);
+
+    // smart case: lowercase query matches uppercase line
+    try std.testing.expect(levvy_score("readme", "README.md", 256) >= 0);
+    // but uppercase query requires uppercase
+    try std.testing.expectEqual(@as(c_int, -1), levvy_score("XYZ", "xyz", 256));
 }
 
 test "handle api: empty input and null handle" {
