@@ -438,6 +438,277 @@ fn compute_distance_simd_scan(
     return prev0[0] - if (bias > 0) streak_bias else 0;
 }
 
+// -- persistent handle api --
+//
+// a picker re-queries the same candidate set on every keystroke; the
+// per-call setup (strlen, padded exact+lowercase copies, dp plane
+// allocation) is the dominant cost for short queries. levvy_create does all
+// of that once; levvy_search then only runs the dp kernel, optionally
+// spread across threads (lines are independent).
+//
+//   handle = levvy_create(lines, n)      -- preprocess, returns null on oom
+//   levvy_search(handle, q, out, threads) -- threads: 0 = one per cpu
+//   levvy_destroy(handle)
+
+const max_supported_threads = 64;
+const is_linux = @import("builtin").os.tag == .linux;
+
+// a parallel search only pays if every thread gets a decent slice of work;
+// roughly the number of dp cells a pool wakeup is worth
+const cells_per_thread = 100_000;
+
+const Levvy = struct {
+    n: usize,
+    longest: u16,
+    total_chars: usize,
+    plane_len: usize,
+    max_threads: usize,
+    line_lens: []u16,
+    line_offsets: []usize, // into the exact/lower arenas
+    exact: []u8,
+    lower: []u8,
+    planes: []u16, // max_threads * 4 * plane_len
+
+    // persistent worker pool (linux): workers park on a futex over
+    // `generation`; a search publishes `job`, bumps the generation and wakes
+    // everyone; workers signal completion by decrementing `pending`.
+    // thread spawn costs ~100us+ under wsl2, a futex wakeup is ~microseconds,
+    // which is what makes threading pay at keystroke granularity.
+    generation: std.atomic.Value(u32),
+    pending: std.atomic.Value(u32),
+    pool_stop: bool,
+    job: Job,
+    nworkers: usize,
+    workers_tried: bool,
+    workers: [max_supported_threads]std.Thread,
+
+    const Job = struct {
+        query: [*:0]const u8 = undefined,
+        q_len: u16 = 0,
+        output: [*]u16 = undefined,
+        want: usize = 0,
+        chunk: usize = 0,
+    };
+};
+
+fn futex_wait(addr: *const std.atomic.Value(u32), expect: u32) void {
+    _ = std.os.linux.futex_4arg(addr, .{ .cmd = .WAIT, .private = true }, expect, null);
+}
+
+fn futex_wake(addr: *const std.atomic.Value(u32), count: u32) void {
+    _ = std.os.linux.futex_3arg(addr, .{ .cmd = .WAKE, .private = true }, count);
+}
+
+fn worker_loop(self: *Levvy, index: usize) void {
+    var seen: u32 = 0;
+    while (true) {
+        while (true) {
+            const g = self.generation.load(.acquire);
+            if (g != seen) {
+                seen = g;
+                break;
+            }
+            futex_wait(&self.generation, g);
+        }
+        if (self.pool_stop) return;
+
+        const job = self.job;
+        // main runs chunk 0, worker `index` runs chunk index + 1
+        const start = (index + 1) * job.chunk;
+        if (index + 1 < job.want and start < self.n) {
+            const end = @min(start + job.chunk, self.n);
+            score_range(self, job.query, job.q_len, job.output, index + 1, start, end);
+        }
+
+        if (self.pending.fetchSub(1, .release) == 1) {
+            futex_wake(&self.pending, 1);
+        }
+    }
+}
+
+fn ensure_workers(self: *Levvy) void {
+    if (self.workers_tried) return;
+    self.workers_tried = true;
+    const target = self.max_threads - 1; // the calling thread participates too
+    for (0..target) |i| {
+        self.workers[i] = std.Thread.spawn(.{}, worker_loop, .{ self, i }) catch break;
+        self.nworkers = i + 1;
+    }
+}
+
+const levvy_allocator = std.heap.page_allocator;
+
+fn levvy_create_inner(input: [*]const [*:0]const u8, number_of_lines: c_uint) !*Levvy {
+    const n: usize = number_of_lines;
+    const self = try levvy_allocator.create(Levvy);
+    errdefer levvy_allocator.destroy(self);
+
+    self.n = n;
+
+    self.line_lens = try levvy_allocator.alloc(u16, n);
+    errdefer levvy_allocator.free(self.line_lens);
+    self.line_offsets = try levvy_allocator.alloc(usize, n);
+    errdefer levvy_allocator.free(self.line_offsets);
+
+    var longest: u16 = 0;
+    var total: usize = 0;
+    var total_chars: usize = 0;
+    for (0..n) |i| {
+        const l_len = @as(u16, @intCast(std.mem.len(input[i])));
+        self.line_lens[i] = l_len;
+        self.line_offsets[i] = total;
+        total += @as(usize, l_len) + simd_width;
+        total_chars += l_len;
+        if (l_len > longest) longest = l_len;
+    }
+    self.longest = longest;
+    self.total_chars = total_chars;
+
+    self.exact = try levvy_allocator.alloc(u8, total);
+    errdefer levvy_allocator.free(self.exact);
+    self.lower = try levvy_allocator.alloc(u8, total);
+    errdefer levvy_allocator.free(self.lower);
+
+    for (0..n) |i| {
+        const off = self.line_offsets[i];
+        const l_len = self.line_lens[i];
+        for (0..l_len) |j| {
+            const c = input[i][j];
+            self.exact[off + j] = c;
+            self.lower[off + j] = if ('A' <= c and c <= 'Z') c | 32 else c;
+        }
+        @memset(self.exact[off + l_len ..][0..simd_width], 0);
+        @memset(self.lower[off + l_len ..][0..simd_width], 0);
+    }
+
+    self.plane_len = @as(usize, longest) + 1 + simd_width;
+    self.max_threads = @max(@min(std.Thread.getCpuCount() catch 1, max_supported_threads), 1);
+    self.planes = try levvy_allocator.alloc(u16, self.max_threads * 4 * self.plane_len);
+    errdefer levvy_allocator.free(self.planes);
+
+    self.generation = std.atomic.Value(u32).init(0);
+    self.pending = std.atomic.Value(u32).init(0);
+    self.pool_stop = false;
+    self.job = .{};
+    self.nworkers = 0;
+    self.workers_tried = false;
+
+    return self;
+}
+
+pub export fn levvy_create(input: [*]const [*:0]const u8, number_of_lines: c_uint) callconv(.c) ?*anyopaque {
+    const self = levvy_create_inner(input, number_of_lines) catch return null;
+    return @ptrCast(self);
+}
+
+pub export fn levvy_destroy(handle: ?*anyopaque) callconv(.c) void {
+    const self: *Levvy = @ptrCast(@alignCast(handle orelse return));
+    if (self.nworkers > 0) {
+        self.pool_stop = true;
+        _ = self.generation.fetchAdd(1, .release);
+        futex_wake(&self.generation, @intCast(self.nworkers));
+        for (self.workers[0..self.nworkers]) |t| t.join();
+    }
+    levvy_allocator.free(self.planes);
+    levvy_allocator.free(self.lower);
+    levvy_allocator.free(self.exact);
+    levvy_allocator.free(self.line_offsets);
+    levvy_allocator.free(self.line_lens);
+    levvy_allocator.destroy(self);
+}
+
+fn score_range(self: *const Levvy, query: [*:0]const u8, q_len: u16, output: [*]u16, thread_index: usize, start: usize, end: usize) void {
+    const plane_len = self.plane_len;
+    const planes = self.planes[thread_index * 4 * plane_len ..][0 .. 4 * plane_len];
+    @memset(planes, 0xffff);
+
+    for (start..end) |i| {
+        const h_len = self.line_lens[i];
+        const off = self.line_offsets[i];
+
+        // re-poison the slack lanes a previous longer line may have dirtied
+        const wipe_start = @as(usize, h_len) + 1;
+        for (0..4) |p| {
+            const plane = planes[p * plane_len ..][0..plane_len];
+            @memset(plane[wipe_start..@min(plane_len, wipe_start + simd_width)], 0xffff);
+        }
+
+        output[i] = compute_distance_simd_scan(
+            query,
+            q_len,
+            self.exact[off..][0 .. @as(usize, h_len) + simd_width],
+            self.lower[off..][0 .. @as(usize, h_len) + simd_width],
+            h_len,
+            self.longest - h_len,
+            planes[0 * plane_len ..][0..plane_len],
+            planes[1 * plane_len ..][0..plane_len],
+            planes[2 * plane_len ..][0..plane_len],
+            planes[3 * plane_len ..][0..plane_len],
+        );
+    }
+}
+
+pub export fn levvy_search(handle: ?*anyopaque, query: [*:0]const u8, output: [*]u16, threads: c_uint) callconv(.c) c_int {
+    const self: *Levvy = @ptrCast(@alignCast(handle orelse return -1));
+    if (self.n == 0) return -1;
+
+    const q_len: u16 = @as(u16, @intCast(std.mem.len(query)));
+
+    // size the crew to the work: below ~cells_per_thread dp cells per thread
+    // the coordination costs more than it buys
+    const cells = @as(usize, q_len) * self.total_chars;
+    const worth = @max(cells / cells_per_thread, 1);
+    var want: usize = if (threads == 0) @min(worth, self.max_threads) else @min(threads, self.max_threads);
+    want = @min(want, @max(self.n / 64, 1));
+
+    if (want > 1 and is_linux) {
+        ensure_workers(self);
+        want = @min(want, self.nworkers + 1);
+    }
+
+    if (want <= 1) {
+        score_range(self, query, q_len, output, 0, 0, self.n);
+    } else if (is_linux) {
+        // dispatch to the parked pool
+        const chunk = (self.n + want - 1) / want;
+        self.job = .{ .query = query, .q_len = q_len, .output = output, .want = want, .chunk = chunk };
+        self.pending.store(@intCast(self.nworkers), .monotonic);
+        _ = self.generation.fetchAdd(1, .release);
+        // wake count is an `int` in the kernel: must be positive, not maxInt(u32)
+        futex_wake(&self.generation, @intCast(self.nworkers));
+
+        score_range(self, query, q_len, output, 0, 0, @min(chunk, self.n));
+
+        while (true) {
+            const p = self.pending.load(.acquire);
+            if (p == 0) break;
+            futex_wait(&self.pending, p);
+        }
+    } else {
+        // no futex here: spawn per call (fine for one-shot use)
+        const chunk = (self.n + want - 1) / want;
+        var handles: [max_supported_threads]?std.Thread = @splat(null);
+        for (1..want) |t| {
+            const start = t * chunk;
+            if (start >= self.n) break;
+            const end = @min(start + chunk, self.n);
+            handles[t] = std.Thread.spawn(.{}, score_range, .{ self, query, q_len, output, t, start, end }) catch blk: {
+                // couldn't spawn: do that slice on this thread instead
+                score_range(self, query, q_len, output, t, start, end);
+                break :blk null;
+            };
+        }
+        score_range(self, query, q_len, output, 0, 0, @min(chunk, self.n));
+        for (handles) |h| if (h) |thread| thread.join();
+    }
+
+    var shortest: u16 = output[0];
+    for (1..self.n) |i| {
+        if (output[i] < shortest) shortest = output[i];
+    }
+    return @as(c_int, @intCast(shortest));
+}
+
 test "simple test" {
     var list: std.ArrayList(i32) = .empty;
     defer list.deinit(std.testing.allocator); // try commenting this out and see if zig detects the memory leak!
@@ -689,6 +960,60 @@ test "simd: fuzzy_search_simd matches fuzzy_search" {
 
     try std.testing.expectEqual(result, result_simd);
     try std.testing.expectEqualSlices(u16, outputs[0..], outputs_simd[0..]);
+}
+
+test "handle api: agrees with fuzzy_search, reused across queries and thread counts" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(51);
+    const r = prng.random();
+    const pool = "abcdefgXYZAbC_./(){}=:;<> \"'0123456789";
+
+    const n = 500;
+    var lines: [n][*:0]const u8 = undefined;
+    var allocated: [n][:0]u8 = undefined;
+    for (0..n) |i| {
+        const max_len: usize = if (i % 3 == 0) 90 else 9;
+        const len = r.intRangeAtMost(usize, 0, max_len);
+        const buf = allocator.allocSentinel(u8, len, 0) catch unreachable;
+        for (buf) |*c| c.* = pool[r.intRangeAtMost(usize, 0, pool.len - 1)];
+        allocated[i] = buf;
+        lines[i] = buf.ptr;
+    }
+    defer for (allocated) |buf| allocator.free(buf);
+
+    const handle = levvy_create(&lines, n);
+    try std.testing.expect(handle != null);
+    defer levvy_destroy(handle);
+
+    const test_queries = [_][*:0]const u8{ "", "abc", "AbC", "xq0", "conxtime", "abc" };
+    for (test_queries) |query| {
+        var out_ref: [n]u16 = undefined;
+        var out_single: [n]u16 = undefined;
+        var out_auto: [n]u16 = undefined;
+        var out_many: [n]u16 = undefined;
+
+        const r_ref = fuzzy_search(query, n, &lines, &out_ref);
+        const r_single = levvy_search(handle, query, &out_single, 1);
+        const r_auto = levvy_search(handle, query, &out_auto, 0);
+        const r_many = levvy_search(handle, query, &out_many, 3);
+
+        try std.testing.expectEqual(r_ref, r_single);
+        try std.testing.expectEqual(r_ref, r_auto);
+        try std.testing.expectEqual(r_ref, r_many);
+        try std.testing.expectEqualSlices(u16, &out_ref, &out_single);
+        try std.testing.expectEqualSlices(u16, &out_ref, &out_auto);
+        try std.testing.expectEqualSlices(u16, &out_ref, &out_many);
+    }
+}
+
+test "handle api: empty input and null handle" {
+    var out: [1]u16 = undefined;
+    const lines: [1][*:0]const u8 = .{"x"};
+    const handle = levvy_create(&lines, 0);
+    defer levvy_destroy(handle);
+    try std.testing.expectEqual(@as(c_int, -1), levvy_search(handle, "q", &out, 0));
+    try std.testing.expectEqual(@as(c_int, -1), levvy_search(null, "q", &out, 0));
+    levvy_destroy(null);
 }
 
 test "property: padding adds exactly padding * skip_cost" {
