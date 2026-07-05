@@ -798,6 +798,169 @@ pub export fn levvy_score(query: [*:0]const u8, line: [*:0]const u8, pad_to: c_u
     return @as(c_int, @intCast(d));
 }
 
+// -- match position reconstruction (for highlighting) --
+//
+// walks an optimal path through the full dp table and reports which line
+// positions were consumed by 'match' operations. only called for entries
+// actually displayed, so a plain scalar full table is plenty.
+//
+// note the full table uses the same min(q,h)*streak_bias offset as the fast
+// implementations: the (min-1) variant the typescript reference uses can
+// dip one streak_bias below zero on the top-left cm=1 cell, which u16
+// can't represent. the offset is uniform across cells, so path choices are
+// unaffected.
+
+fn adjusted_chars(q_c: u8, h_c: u8) [2]u8 {
+    var a = q_c;
+    var b = h_c;
+    if (case_setting == 2) {
+        if ('A' <= a and a <= 'Z') a |= 32;
+        if ('A' <= b and b <= 'Z') b |= 32;
+    } else if (case_setting == 1 and 'a' <= a and a <= 'z') {
+        if ('A' <= b and b <= 'Z') b |= 32;
+    }
+    return .{ a, b };
+}
+
+// dp must be (q_len + 1) * (h_len + 1) * 2 long
+fn compute_full_table(q: [*]const u8, q_len: u16, h: [*]const u8, h_len: u16, dp: []u16) void {
+    const B: usize = 2;
+    const BH: usize = B * (@as(usize, h_len) + 1);
+    const bias: u16 = @min(q_len, h_len) * streak_bias;
+
+    var q_i: usize = 0;
+    while (q_i <= q_len) : (q_i += 1) {
+        const dist: u16 = @as(u16, @intCast(q_len - q_i)) * del_cost + bias;
+        dp[q_i * BH + h_len * B + 0] = dist;
+        dp[q_i * BH + h_len * B + 1] = dist;
+    }
+    var h_i: usize = 0;
+    while (h_i <= h_len) : (h_i += 1) {
+        const dist: u16 = @as(u16, @intCast(h_len - h_i)) * skip_cost + bias;
+        dp[@as(usize, q_len) * BH + h_i * B + 0] = dist;
+        dp[@as(usize, q_len) * BH + h_i * B + 1] = dist;
+    }
+
+    q_i = q_len;
+    while (q_i > 0) {
+        q_i -= 1;
+        h_i = h_len;
+        while (h_i > 0) {
+            h_i -= 1;
+            const pair = adjusted_chars(q[q_i], h[h_i]);
+            const is_match = pair[0] == pair[1];
+
+            const del_total = del_cost + dp[(q_i + 1) * BH + h_i * B + 0];
+            const skip_total = skip_cost + dp[q_i * BH + (h_i + 1) * B + 0];
+            const match_total =
+                if (is_match) dp[(q_i + 1) * BH + (h_i + 1) * B + 1] else sub_cost + dp[(q_i + 1) * BH + (h_i + 1) * B + 0];
+            dp[q_i * BH + h_i * B + 0] = @min(del_total, @min(skip_total, match_total));
+
+            const del_cm1 = del_cost + dp[(q_i + 1) * BH + h_i * B + 1];
+            const skip_cm1 = skip_cost + dp[q_i * BH + (h_i + 1) * B + 0];
+            const match_cm1 =
+                if (is_match) dp[(q_i + 1) * BH + (h_i + 1) * B + 1] - streak_bias else sub_cost + dp[(q_i + 1) * BH + (h_i + 1) * B + 0];
+            dp[q_i * BH + h_i * B + 1] = @min(del_cm1, @min(skip_cm1, match_cm1));
+        }
+    }
+}
+
+// walks the table from (0, 0), preferring match > substitute > delete > skip
+// among cost-consistent options (mirrors path() in the prototype); returns
+// how many match positions were written to out
+fn walk_positions(q: [*]const u8, q_len: u16, h: [*]const u8, h_len: u16, dp: []const u16, out: [*]u16, out_cap: usize) usize {
+    const B: usize = 2;
+    const BH: usize = B * (@as(usize, h_len) + 1);
+
+    var count: usize = 0;
+    var q_i: usize = 0;
+    var h_i: usize = 0;
+    var cm: usize = 0;
+
+    while (q_i < q_len or h_i < h_len) {
+        const current: i32 = dp[q_i * BH + h_i * B + cm];
+
+        var is_match = false;
+        if (q_i < q_len and h_i < h_len) {
+            const pair = adjusted_chars(q[q_i], h[h_i]);
+            is_match = pair[0] == pair[1];
+        }
+
+        // match (or substitute)
+        if (q_i < q_len and h_i < h_len) {
+            if (is_match) {
+                const op_cost: i32 = if (cm == 1) -@as(i32, streak_bias) else 0;
+                if (op_cost + @as(i32, dp[(q_i + 1) * BH + (h_i + 1) * B + 1]) == current) {
+                    if (count < out_cap) out[count] = @intCast(h_i);
+                    count += 1;
+                    q_i += 1;
+                    h_i += 1;
+                    cm = 1;
+                    continue;
+                }
+            } else {
+                if (sub_cost + @as(i32, dp[(q_i + 1) * BH + (h_i + 1) * B + 0]) == current) {
+                    q_i += 1;
+                    h_i += 1;
+                    cm = 0;
+                    continue;
+                }
+            }
+        }
+
+        // delete
+        if (q_i < q_len and del_cost + @as(i32, dp[(q_i + 1) * BH + h_i * B + cm]) == current) {
+            q_i += 1;
+            continue;
+        }
+
+        // skip
+        if (h_i < h_len and skip_cost + @as(i32, dp[q_i * BH + (h_i + 1) * B + 0]) == current) {
+            h_i += 1;
+            cm = 0;
+            continue;
+        }
+
+        // no cost-consistent operation: table and walk disagree, give up
+        // rather than loop forever (should be impossible)
+        return count;
+    }
+
+    return count;
+}
+
+// returns the number of match positions written to out (0-based byte
+// offsets into line, strictly increasing, at most min(out_cap, #query)),
+// or -1 when the query doesn't match the line at all
+pub export fn levvy_positions(query: [*:0]const u8, line: [*:0]const u8, out: [*]u16, out_cap: c_uint) callconv(.c) c_int {
+    const q_len_full = std.mem.len(query);
+    const h_len_full = std.mem.len(line);
+
+    // same smart-case subsequence gate as levvy_score
+    {
+        var q_i: usize = 0;
+        var h_i: usize = 0;
+        while (q_i < q_len_full and h_i < h_len_full) {
+            const pair = adjusted_chars(query[q_i], line[h_i]);
+            if (pair[0] == pair[1]) q_i += 1;
+            h_i += 1;
+        }
+        if (q_i < q_len_full) return -1;
+    }
+
+    const q_len: u16 = @intCast(@min(q_len_full, score_max_line));
+    const h_len: u16 = @intCast(@min(h_len_full, score_max_line));
+    if (q_len == 0) return 0;
+
+    const allocator = std.heap.page_allocator;
+    const dp = allocator.alloc(u16, (@as(usize, q_len) + 1) * (@as(usize, h_len) + 1) * 2) catch return -1;
+    defer allocator.free(dp);
+
+    compute_full_table(query, q_len, line, h_len, dp);
+    const count = walk_positions(query, q_len, line, h_len, dp, out, out_cap);
+    return @intCast(@min(count, out_cap));
+}
+
 test "simple test" {
     var list: std.ArrayList(i32) = .empty;
     defer list.deinit(std.testing.allocator); // try commenting this out and see if zig detects the memory leak!
@@ -1175,6 +1338,106 @@ test "levvy_score: ranking sanity for a picker" {
     try std.testing.expect(levvy_score("readme", "README.md", 256) >= 0);
     // but uppercase query requires uppercase
     try std.testing.expectEqual(@as(c_int, -1), levvy_score("XYZ", "xyz", 256));
+}
+
+test "positions: exact substring highlights the contiguous range" {
+    var out: [16]u16 = undefined;
+    const n = levvy_positions("abc", "xxabcxx", &out, out.len);
+    try std.testing.expectEqual(@as(c_int, 3), n);
+    try std.testing.expectEqualSlices(u16, &.{ 2, 3, 4 }, out[0..3]);
+
+    // smart case
+    const n2 = levvy_positions("keymaps", "plugin/KeyMaps.lua", &out, out.len);
+    try std.testing.expectEqual(@as(c_int, 7), n2);
+    try std.testing.expectEqualSlices(u16, &.{ 7, 8, 9, 10, 11, 12, 13 }, out[0..7]);
+
+    // no match
+    try std.testing.expectEqual(@as(c_int, -1), levvy_positions("zzz", "abc", &out, out.len));
+    // empty query
+    try std.testing.expectEqual(@as(c_int, 0), levvy_positions("", "abc", &out, out.len));
+}
+
+test "positions: faraway characters still get matched (skips are paid either way)" {
+    // every line character is consumed regardless, so matching a query char
+    // (free) always beats deleting it and skipping the char anyway -- for a
+    // subsequence query, every query character ends up highlighted
+    var line: [64:0]u8 = undefined;
+    @memset(line[0..64], '_');
+    line[0] = 'a';
+    line[63] = 'b';
+    line[64] = 0;
+    var out: [16]u16 = undefined;
+    const n = levvy_positions("ab", &line, &out, out.len);
+    try std.testing.expectEqual(@as(c_int, 2), n);
+    try std.testing.expectEqualSlices(u16, &.{ 0, 63 }, out[0..2]);
+}
+
+test "positions: full table agrees with the scalar distance" {
+    var prng = std.Random.DefaultPrng.init(53);
+    const r = prng.random();
+    var qbuf: [max_test_len]u8 = undefined;
+    var hbuf: [max_test_len]u8 = undefined;
+    var dp: [(20 + 1) * (max_test_len + 1) * 2]u16 = undefined;
+    for (0..300) |_| {
+        const q = random_string(r, &qbuf, 20);
+        const h = random_string(r, &hbuf, 90);
+        const q_len: u16 = @intCast(q.len);
+        const h_len: u16 = @intCast(h.len);
+        compute_full_table(q.ptr, q_len, h.ptr, h_len, dp[0 .. (@as(usize, q_len) + 1) * (@as(usize, h_len) + 1) * 2]);
+        const bias: u16 = @min(q_len, h_len) * streak_bias;
+        const from_table = dp[0] - if (bias > 0) streak_bias else 0;
+        try std.testing.expectEqual(test_distance(q, h, 0), from_table);
+    }
+}
+
+test "positions: walk invariants on random subsequence queries" {
+    var prng = std.Random.DefaultPrng.init(54);
+    const r = prng.random();
+    var hbuf: [max_test_len:0]u8 = undefined;
+    var qbuf: [max_test_len:0]u8 = undefined;
+    var out: [32]u16 = undefined;
+    const pool = "abcDEfgH_./ 12";
+
+    for (0..300) |_| {
+        const h_len = r.intRangeAtMost(usize, 1, 60);
+        for (hbuf[0..h_len]) |*c| c.* = pool[r.intRangeAtMost(usize, 0, pool.len - 1)];
+        hbuf[h_len] = 0;
+
+        // draw a real subsequence as the query
+        var q_len: usize = 0;
+        var h_i: usize = 0;
+        while (h_i < h_len) : (h_i += 1) {
+            if (r.boolean() and q_len < 12) {
+                qbuf[q_len] = hbuf[h_i];
+                q_len += 1;
+            }
+        }
+        qbuf[q_len] = 0;
+
+        const n = levvy_positions(qbuf[0..q_len :0], hbuf[0..h_len :0], &out, out.len);
+        try std.testing.expect(n >= 0);
+        const count: usize = @intCast(n);
+        try std.testing.expect(count <= q_len);
+        for (out[0..count], 0..) |p, k| {
+            try std.testing.expect(p < h_len);
+            if (k > 0) try std.testing.expect(out[k - 1] < p);
+        }
+        // the highlighted characters must be matchable against the query in
+        // order (the walk may delete query characters in between)
+        var qi: usize = 0;
+        for (out[0..count]) |p| {
+            var found = false;
+            while (qi < q_len) : (qi += 1) {
+                const pair = adjusted_chars(qbuf[qi], hbuf[p]);
+                if (pair[0] == pair[1]) {
+                    qi += 1;
+                    found = true;
+                    break;
+                }
+            }
+            try std.testing.expect(found);
+        }
+    }
 }
 
 test "handle api: empty input and null handle" {
