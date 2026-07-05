@@ -55,4 +55,22 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
+
+    // Benchmark scalar vs simd (always ReleaseFast, debug numbers are noise)
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const bench_exe = b.addExecutable(.{
+        .name = "levvy_bench",
+        .root_module = bench_mod,
+    });
+    const bench_cmd = b.addRunArtifact(bench_exe);
+    const bench_step = b.step("bench", "Benchmark scalar vs simd fuzzy_search");
+    bench_step.dependOn(&bench_cmd.step);
+
+    if (b.args) |args| {
+        bench_cmd.addArgs(args);
+    }
 }
