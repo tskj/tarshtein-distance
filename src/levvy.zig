@@ -120,6 +120,107 @@ test "simple test" {
     try std.testing.expectEqual(@as(i32, 42), list.pop().?);
 }
 
+// -- property tests (mirroring property.test.ts in levvy-prototype) --
+
+const max_test_len = 100;
+
+fn test_distance(q: []const u8, h: []const u8, padding: u16) u16 {
+    var curr: [(max_test_len + 1) * 2]u16 = undefined;
+    var prev: [(max_test_len + 1) * 2]u16 = undefined;
+    return compute_distance(q.ptr, @intCast(q.len), h.ptr, @intCast(h.len), padding, curr[0..], prev[0..]);
+}
+
+fn random_string(r: std.Random, buf: []u8, max_len: usize) []u8 {
+    const pool = "abcdefgXYZAbC_./(){}=:;<> \"'0123456789";
+    const len = r.intRangeAtMost(usize, 0, max_len);
+    for (buf[0..len]) |*c| c.* = pool[r.intRangeAtMost(usize, 0, pool.len - 1)];
+    return buf[0..len];
+}
+
+test "property: when q == h and padding: 0, distance should be 0" {
+    var prng = std.Random.DefaultPrng.init(42);
+    const r = prng.random();
+    var buf: [max_test_len]u8 = undefined;
+    for (0..300) |_| {
+        const s = random_string(r, &buf, 60);
+        try std.testing.expectEqual(@as(u16, 0), test_distance(s, s, 0));
+    }
+}
+
+test "property: empty haystack costs q.len * del_cost; empty query costs h.len * skip_cost" {
+    var prng = std.Random.DefaultPrng.init(43);
+    const r = prng.random();
+    var buf: [max_test_len]u8 = undefined;
+    for (0..200) |_| {
+        const s = random_string(r, &buf, 60);
+        try std.testing.expectEqual(@as(u16, @intCast(s.len * del_cost)), test_distance(s, "", 0));
+        try std.testing.expectEqual(@as(u16, @intCast(s.len * skip_cost)), test_distance("", s, 0));
+    }
+}
+
+test "property: smart case: an all-lowercase query is case-insensitive in the haystack" {
+    var prng = std.Random.DefaultPrng.init(44);
+    const r = prng.random();
+    const lower_pool = "abcdefghij_./ 0123";
+    var qbuf: [16]u8 = undefined;
+    var hbuf: [32]u8 = undefined;
+    var hbuf_recased: [32]u8 = undefined;
+    for (0..200) |_| {
+        const q_len = r.intRangeAtMost(usize, 0, 8);
+        for (qbuf[0..q_len]) |*c| c.* = lower_pool[r.intRangeAtMost(usize, 0, lower_pool.len - 1)];
+        const h_len = r.intRangeAtMost(usize, 0, 12);
+        for (hbuf[0..h_len], hbuf_recased[0..h_len]) |*c, *rc| {
+            c.* = lower_pool[r.intRangeAtMost(usize, 0, lower_pool.len - 1)];
+            rc.* = if (r.boolean() and 'a' <= c.* and c.* <= 'z') c.* - 32 else c.*;
+        }
+        try std.testing.expectEqual(
+            test_distance(qbuf[0..q_len], hbuf[0..h_len], 0),
+            test_distance(qbuf[0..q_len], hbuf_recased[0..h_len], 0),
+        );
+    }
+}
+
+test "property: contiguous matches beat scattered matches" {
+    var prng = std.Random.DefaultPrng.init(45);
+    const r = prng.random();
+    const letters = "abcdefghijklmnop";
+    var qbuf: [8]u8 = undefined;
+    var contiguous: [max_test_len]u8 = undefined;
+    var scattered: [max_test_len]u8 = undefined;
+    for (0..200) |_| {
+        const q_len = r.intRangeAtMost(usize, 2, 6);
+        for (qbuf[0..q_len]) |*c| c.* = letters[r.intRangeAtMost(usize, 0, letters.len - 1)];
+        const q = qbuf[0..q_len];
+        const extra = r.intRangeAtMost(usize, 0, 4);
+        const gaps = q_len - 1 + extra;
+        const h_len = q_len + gaps;
+
+        @memset(contiguous[0..h_len], '_');
+        @memcpy(contiguous[0..q_len], q);
+
+        @memset(scattered[0..h_len], '_');
+        for (q, 0..) |c, i| scattered[i * 2] = c;
+
+        try std.testing.expect(test_distance(q, contiguous[0..h_len], 0) < test_distance(q, scattered[0..h_len], 0));
+    }
+}
+
+test "property: padding adds exactly padding * skip_cost" {
+    var prng = std.Random.DefaultPrng.init(46);
+    const r = prng.random();
+    var qbuf: [max_test_len]u8 = undefined;
+    var hbuf: [max_test_len]u8 = undefined;
+    for (0..200) |_| {
+        const q = random_string(r, &qbuf, 20);
+        const h = random_string(r, &hbuf, 40);
+        const padding = r.intRangeAtMost(u16, 0, 8);
+        try std.testing.expectEqual(
+            test_distance(q, h, 0) + padding * skip_cost,
+            test_distance(q, h, padding),
+        );
+    }
+}
+
 test "fuzzy_search simple test" {
     const query: [*:0]const u8 = "hello";
     const number_of_lines: c_uint = 6;
