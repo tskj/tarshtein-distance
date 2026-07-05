@@ -57,6 +57,7 @@ pub fn main() !void {
 
     var grand_scalar: u64 = 0;
     var grand_simd: u64 = 0;
+    var grand_scan: u64 = 0;
 
     for (datasets) |dataset| {
         var lines: std.ArrayList([*:0]const u8) = .empty;
@@ -86,28 +87,36 @@ pub fn main() !void {
 
         const out_scalar = try allocator.alloc(u16, n);
         const out_simd = try allocator.alloc(u16, n);
+        const out_scan = try allocator.alloc(u16, n);
 
         const reps = 20;
         var total_scalar: u64 = 0;
         var total_simd: u64 = 0;
+        var total_scan: u64 = 0;
 
         for (queries) |query| {
             const t_scalar = bench_one(levvy.fuzzy_search, query, lines.items, out_scalar.ptr, reps);
             const t_simd = bench_one(levvy.fuzzy_search_simd, query, lines.items, out_simd.ptr, reps);
+            const t_scan = bench_one(levvy.fuzzy_search_simd_scan, query, lines.items, out_scan.ptr, reps);
             total_scalar += t_scalar;
             total_simd += t_simd;
+            total_scan += t_scan;
 
             var mismatches: usize = 0;
             for (out_scalar, out_simd) |a, b| {
                 if (a != b) mismatches += 1;
             }
+            for (out_scalar, out_scan) |a, b| {
+                if (a != b) mismatches += 1;
+            }
 
-            const speedup = @as(f64, @floatFromInt(t_scalar)) / @as(f64, @floatFromInt(t_simd));
-            std.debug.print("query {s:>14}: scalar {d:>8.3} ms, simd {d:>8.3} ms, speedup {d:.2}x{s}\n", .{
+            std.debug.print("query {s:>14}: scalar {d:>8.3} ms | simd {d:>7.3} ms ({d:.2}x) | scan {d:>7.3} ms ({d:.2}x){s}\n", .{
                 query,
                 @as(f64, @floatFromInt(t_scalar)) / 1e6,
                 @as(f64, @floatFromInt(t_simd)) / 1e6,
-                speedup,
+                @as(f64, @floatFromInt(t_scalar)) / @as(f64, @floatFromInt(t_simd)),
+                @as(f64, @floatFromInt(t_scan)) / 1e6,
+                @as(f64, @floatFromInt(t_scalar)) / @as(f64, @floatFromInt(t_scan)),
                 if (mismatches > 0) " !! OUTPUT MISMATCH" else "",
             });
             if (mismatches > 0) std.debug.print("  {d} mismatching lines\n", .{mismatches});
@@ -115,19 +124,22 @@ pub fn main() !void {
 
         grand_scalar += total_scalar;
         grand_simd += total_simd;
+        grand_scan += total_scan;
 
-        const total_speedup = @as(f64, @floatFromInt(total_scalar)) / @as(f64, @floatFromInt(total_simd));
-        std.debug.print("dataset total: scalar {d:.3} ms, simd {d:.3} ms, speedup {d:.2}x\n", .{
+        std.debug.print("dataset total: scalar {d:.3} ms | simd {d:.3} ms ({d:.2}x) | scan {d:.3} ms ({d:.2}x)\n", .{
             @as(f64, @floatFromInt(total_scalar)) / 1e6,
             @as(f64, @floatFromInt(total_simd)) / 1e6,
-            total_speedup,
+            @as(f64, @floatFromInt(total_scalar)) / @as(f64, @floatFromInt(total_simd)),
+            @as(f64, @floatFromInt(total_scan)) / 1e6,
+            @as(f64, @floatFromInt(total_scalar)) / @as(f64, @floatFromInt(total_scan)),
         });
     }
 
-    const grand_speedup = @as(f64, @floatFromInt(grand_scalar)) / @as(f64, @floatFromInt(grand_simd));
-    std.debug.print("\ngrand total: scalar {d:.3} ms, simd {d:.3} ms, speedup {d:.2}x\n", .{
+    std.debug.print("\ngrand total: scalar {d:.3} ms | simd {d:.3} ms ({d:.2}x) | scan {d:.3} ms ({d:.2}x)\n", .{
         @as(f64, @floatFromInt(grand_scalar)) / 1e6,
         @as(f64, @floatFromInt(grand_simd)) / 1e6,
-        grand_speedup,
+        @as(f64, @floatFromInt(grand_scalar)) / @as(f64, @floatFromInt(grand_simd)),
+        @as(f64, @floatFromInt(grand_scan)) / 1e6,
+        @as(f64, @floatFromInt(grand_scalar)) / @as(f64, @floatFromInt(grand_scan)),
     });
 }

@@ -131,7 +131,9 @@ fn compute_distance(q: [*]const u8, q_len: u16, h: [*]const u8, h_len: u16, padd
 
 const simd_width = std.simd.suggestVectorLength(u16) orelse 8;
 
-pub export fn fuzzy_search_simd(query: [*:0]const u8, number_of_lines: c_uint, input: [*]const [*:0]const u8, output: [*]u16) callconv(.c) c_int {
+const ComputeFn = fn ([*]const u8, u16, []const u8, []const u8, u16, u16, []u16, []u16, []u16, []u16) u16;
+
+fn search_with_planes(comptime compute: ComputeFn, query: [*:0]const u8, number_of_lines: c_uint, input: [*]const [*:0]const u8, output: [*]u16) c_int {
     const q_len: u16 = @as(u16, @intCast(std.mem.len(query)));
 
     var longest_line_length: u16 = 0;
@@ -168,7 +170,16 @@ pub export fn fuzzy_search_simd(query: [*:0]const u8, number_of_lines: c_uint, i
         @memset(h_exact[h_len..], 0);
         @memset(h_lower[h_len..], 0);
 
-        const d = compute_distance_simd(
+        // the planes are reused across lines: a previous, longer line leaves
+        // real (small) values in the lanes past this line's h_len, which the
+        // computations may read -- re-poison the reachable slack
+        const wipe_start = @as(usize, h_len) + 1;
+        for (0..4) |p| {
+            const plane = planes[p * plane_len ..][0..plane_len];
+            @memset(plane[wipe_start..@min(plane_len, wipe_start + simd_width)], 0xffff);
+        }
+
+        const d = compute(
             query,
             q_len,
             h_exact,
@@ -186,6 +197,14 @@ pub export fn fuzzy_search_simd(query: [*:0]const u8, number_of_lines: c_uint, i
 
     if (shortest_dist == null) return -1;
     return @as(c_int, @intCast(shortest_dist.?));
+}
+
+pub export fn fuzzy_search_simd(query: [*:0]const u8, number_of_lines: c_uint, input: [*]const [*:0]const u8, output: [*]u16) callconv(.c) c_int {
+    return search_with_planes(compute_distance_simd, query, number_of_lines, input, output);
+}
+
+pub export fn fuzzy_search_simd_scan(query: [*:0]const u8, number_of_lines: c_uint, input: [*]const [*:0]const u8, output: [*]u16) callconv(.c) c_int {
+    return search_with_planes(compute_distance_simd_scan, query, number_of_lines, input, output);
 }
 
 fn compute_distance_simd(
@@ -273,6 +292,142 @@ fn compute_distance_simd(
             if (skip_total < curr0[h_i]) curr0[h_i] = skip_total;
             if (skip_total < curr1[h_i]) curr1[h_i] = skip_total;
         }
+
+        std.mem.swap([]u16, &prev0, &curr0);
+        std.mem.swap([]u16, &prev1, &curr1);
+    }
+
+    // if we could have a bias we need to remove one
+    // because the first character can't start in a streak
+    return prev0[0] - if (bias > 0) streak_bias else 0;
+}
+
+// -- simd + scan implementation --
+//
+// same candidate computation as compute_distance_simd, but the skip fold is
+// restructured away: unrolling the recurrence
+//   curr0[h] = min(cand0[h], skip + curr0[h+1])
+// gives
+//   curr0[h] = min over m >= h of (cand0[m] + (m - h) * skip)
+// which is a suffix min-plus scan with linear drift. that scan is computed in
+// log2(W) shuffle+add+min steps per W-lane block, so the loop-carried
+// dependency shrinks from one-per-cell to one carry value per block.
+
+// shift lanes towards index 0 by `step`, vacated high lanes take fill[0]
+fn shiftLow(v: @Vector(simd_width, u16), comptime step: comptime_int, fill: @Vector(simd_width, u16)) @Vector(simd_width, u16) {
+    const mask = comptime blk: {
+        var m: [simd_width]i32 = undefined;
+        for (&m, 0..) |*x, k| x.* = if (k + step < simd_width) @as(i32, @intCast(k + step)) else -1;
+        break :blk m;
+    };
+    return @shuffle(u16, v, fill, mask);
+}
+
+fn compute_distance_simd_scan(
+    q: [*]const u8,
+    q_len: u16,
+    h_exact: []const u8,
+    h_lower: []const u8,
+    h_len: u16,
+    padding: u16,
+    prev0_in: []u16,
+    prev1_in: []u16,
+    curr0_in: []u16,
+    curr1_in: []u16,
+) u16 {
+    const W = simd_width;
+    const V = @Vector(W, u16);
+
+    var prev0 = prev0_in;
+    var prev1 = prev1_in;
+    var curr0 = curr0_in;
+    var curr1 = curr1_in;
+
+    const padding_cost: u16 = padding * skip_cost;
+    const bias: u16 = @min(q_len, h_len) * streak_bias; // stops distance going negative
+
+    // base case
+    var h_i: u16 = 0;
+    while (h_i <= h_len) : (h_i += 1) {
+        const dist: u16 = (h_len - h_i) * skip_cost + padding_cost + bias;
+        prev0[h_i] = dist;
+        prev1[h_i] = dist;
+    }
+
+    const sentinel: V = @splat(0xffff);
+    const delv: V = @splat(del_cost);
+    const subv: V = @splat(sub_cost);
+    const streakv: V = @splat(streak_bias);
+    const skipv: V = @splat(skip_cost);
+    // cross-block skip drift: lane k is (block_end - k) skips away from the carry
+    const ramp: V = comptime blk: {
+        var r: [W]u16 = undefined;
+        for (&r, 0..) |*x, k| x.* = @intCast((W - k) * skip_cost);
+        break :blk r;
+    };
+
+    const nblocks = (@as(usize, h_len) + W - 1) / W;
+
+    var q_i = q_len;
+    while (q_i > 0) {
+        q_i -= 1;
+
+        var a = q[q_i];
+        var h_used = h_exact;
+        if (case_setting == 2) {
+            if ('A' <= a and a <= 'Z') a |= 32;
+            h_used = h_lower;
+        } else if (case_setting == 1 and 'a' <= a and a <= 'z') {
+            h_used = h_lower;
+        }
+        const av: @Vector(W, u8) = @splat(a);
+
+        const boundary: u16 = (q_len - q_i) * del_cost + padding_cost + bias;
+
+        // carry holds s[block_end] of the block to the right. for the
+        // rightmost block that's either exactly cell h_len (h_len % W == 0,
+        // whole query deleted from here: boundary) or a lane past it
+        // (sentinel; cell h_len then sits inside the block, where its del
+        // candidate prev0[h_len] + del reproduces the boundary exactly)
+        var carry: u16 = if (h_len % W == 0) boundary else 0xffff;
+
+        var b = nblocks;
+        while (b > 0) {
+            b -= 1;
+            const j = b * W;
+
+            const hv: @Vector(W, u8) = h_used[j..][0..W].*;
+            const is_match = hv == av;
+
+            const p0_curr: V = prev0[j..][0..W].*;
+            const p1_curr: V = prev1[j..][0..W].*;
+            const p0_next: V = prev0[j + 1 ..][0..W].*;
+            const p1_next: V = prev1[j + 1 ..][0..W].*;
+
+            const cand0 = @min(p0_curr +| delv, @select(u16, is_match, p1_next, p0_next +| subv));
+            const cand1 = @min(p1_curr +| delv, @select(u16, is_match, p1_next -| streakv, p0_next +| subv));
+
+            // fold the cross-block carry, then suffix-scan within the block;
+            // s is then exactly curr0 (skip candidate fully included)
+            var s = @min(cand0, @as(V, @splat(carry)) +| ramp);
+            comptime var step = 1;
+            inline while (step < W) : (step *= 2) {
+                s = @min(s, shiftLow(s, step, sentinel) +| @as(V, @splat(step * skip_cost)));
+            }
+
+            curr0[j..][0..W].* = s;
+
+            // curr1[h] = min(cand1[h], skip + curr0[h+1]); the lane shifted in
+            // at the top is s[block_end], i.e. the incoming carry
+            const s_next = shiftLow(s, 1, @as(V, @splat(carry)));
+            curr1[j..][0..W].* = @min(cand1, s_next +| skipv);
+
+            carry = s[0];
+        }
+
+        // boundary cell (whole query deleted); also repairs vector-store spill
+        curr0[h_len] = boundary;
+        curr1[h_len] = boundary;
 
         std.mem.swap([]u16, &prev0, &curr0);
         std.mem.swap([]u16, &prev1, &curr1);
@@ -414,6 +569,104 @@ test "simd: agrees with scalar on random inputs" {
         const h = random_string(r, &hbuf, 90);
         const padding = r.intRangeAtMost(u16, 0, 8);
         try std.testing.expectEqual(test_distance(q, h, padding), test_distance_simd(q, h, padding));
+    }
+}
+
+fn test_distance_simd_scan(q: []const u8, h: []const u8, padding: u16) u16 {
+    const W = simd_width;
+    var h_exact: [max_test_len + W]u8 = undefined;
+    var h_lower: [max_test_len + W]u8 = undefined;
+    for (h, 0..) |c, j| {
+        h_exact[j] = c;
+        h_lower[j] = if ('A' <= c and c <= 'Z') c | 32 else c;
+    }
+    @memset(h_exact[h.len..], 0);
+    @memset(h_lower[h.len..], 0);
+
+    const plane_len = max_test_len + 1 + W;
+    var planes: [4][plane_len]u16 = undefined;
+    for (&planes) |*p| @memset(p, 0xffff);
+
+    return compute_distance_simd_scan(
+        q.ptr,
+        @intCast(q.len),
+        h_exact[0 .. h.len + W],
+        h_lower[0 .. h.len + W],
+        @intCast(h.len),
+        padding,
+        &planes[0],
+        &planes[1],
+        &planes[2],
+        &planes[3],
+    );
+}
+
+test "simd scan: agrees with scalar on random inputs" {
+    var prng = std.Random.DefaultPrng.init(48);
+    const r = prng.random();
+    var qbuf: [max_test_len]u8 = undefined;
+    var hbuf: [max_test_len]u8 = undefined;
+    for (0..1000) |_| {
+        const q = random_string(r, &qbuf, 20);
+        const h = random_string(r, &hbuf, 90);
+        const padding = r.intRangeAtMost(u16, 0, 8);
+        try std.testing.expectEqual(test_distance(q, h, padding), test_distance_simd_scan(q, h, padding));
+    }
+}
+
+test "simd scan: exact block-boundary line lengths" {
+    // h_len % simd_width == 0 takes the carry-seeded path instead of the
+    // in-block boundary identity; exercise both plus the empty line
+    var prng = std.Random.DefaultPrng.init(49);
+    const r = prng.random();
+    var qbuf: [max_test_len]u8 = undefined;
+    var hbuf: [max_test_len]u8 = undefined;
+    const lens = [_]usize{ 0, 1, simd_width - 1, simd_width, simd_width + 1, 2 * simd_width, 4 * simd_width };
+    for (0..100) |_| {
+        const q = random_string(r, &qbuf, 12);
+        for (lens) |h_len| {
+            const pool = "abcABC_ ";
+            for (hbuf[0..h_len]) |*c| c.* = pool[r.intRangeAtMost(usize, 0, pool.len - 1)];
+            const h = hbuf[0..h_len];
+            try std.testing.expectEqual(test_distance(q, h, 3), test_distance_simd_scan(q, h, 3));
+        }
+    }
+}
+
+test "exports agree on random multi-line input (plane reuse across lines)" {
+    // long lines followed by short ones leave stale values in the dp planes;
+    // this drives the three exported entry points over the same varied file
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(50);
+    const r = prng.random();
+    const pool = "abcdefgXYZAbC_./(){}=:;<> \"'0123456789";
+
+    const n = 60;
+    var lines: [n][*:0]const u8 = undefined;
+    var allocated: [n][:0]u8 = undefined;
+    for (0..n) |i| {
+        // alternate long and short lines to stress stale-lane hygiene
+        const max_len: usize = if (i % 2 == 0) 90 else 7;
+        const len = r.intRangeAtMost(usize, 0, max_len);
+        const buf = allocator.allocSentinel(u8, len, 0) catch unreachable;
+        for (buf) |*c| c.* = pool[r.intRangeAtMost(usize, 0, pool.len - 1)];
+        allocated[i] = buf;
+        lines[i] = buf.ptr;
+    }
+    defer for (allocated) |buf| allocator.free(buf);
+
+    const test_queries = [_][*:0]const u8{ "", "abc", "AbC", "xq0", "conxtime" };
+    for (test_queries) |query| {
+        var out_scalar: [n]u16 = undefined;
+        var out_simd: [n]u16 = undefined;
+        var out_scan: [n]u16 = undefined;
+        const r_scalar = fuzzy_search(query, n, &lines, &out_scalar);
+        const r_simd = fuzzy_search_simd(query, n, &lines, &out_simd);
+        const r_scan = fuzzy_search_simd_scan(query, n, &lines, &out_scan);
+        try std.testing.expectEqual(r_scalar, r_simd);
+        try std.testing.expectEqual(r_scalar, r_scan);
+        try std.testing.expectEqualSlices(u16, &out_scalar, &out_simd);
+        try std.testing.expectEqualSlices(u16, &out_scalar, &out_scan);
     }
 }
 
