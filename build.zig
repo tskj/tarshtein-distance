@@ -4,35 +4,37 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Build the shared library for `levvy`
-    const zig_mod = b.addSharedLibrary(.{
-        .name = "levvy",
-        .root_source_file = b.path("src/levvy.zig"),
-        .target = target,
-        .optimize = optimize,
-        // .optimize = .ReleaseFast,
-    });
-
-    // Define relative path for installation
-    const copy_step = b.addInstallFile(zig_mod.getEmittedBin(), "lib/levvy.dll");
-
-    // Make the built-in install step depend on the copy step
-    b.getInstallStep().dependOn(&copy_step.step);
-
-    // Test configuration for `levvy.zig`
-    const lib_tests = b.addTest(.{
+    const levvy_mod = b.createModule(.{
         .root_source_file = b.path("src/levvy.zig"),
         .target = target,
         .optimize = optimize,
     });
-    const run_lib_tests = b.addRunArtifact(lib_tests);
 
-    // Test configuration for `main.zig`
-    const main_tests = b.addTest(.{
+    const main_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
+
+    // Build the shared library for `levvy`
+    const lib = b.addLibrary(.{
+        .name = "levvy",
+        .linkage = .dynamic,
+        .root_module = levvy_mod,
+    });
+
+    // Install into zig-out/lib (levvy.dll on Windows, liblevvy.so on Linux)
+    const install_lib = b.addInstallArtifact(lib, .{
+        .dest_dir = .{ .override = .lib },
+    });
+    b.getInstallStep().dependOn(&install_lib.step);
+
+    // Test configuration for `levvy.zig`
+    const lib_tests = b.addTest(.{ .root_module = levvy_mod });
+    const run_lib_tests = b.addRunArtifact(lib_tests);
+
+    // Test configuration for `main.zig`
+    const main_tests = b.addTest(.{ .root_module = main_mod });
     const run_main_tests = b.addRunArtifact(main_tests);
 
     // Combine both test artifacts in the `test` step
@@ -43,9 +45,7 @@ pub fn build(b: *std.Build) void {
     // Build main executable (for development/testing purposes)
     const exe = b.addExecutable(.{
         .name = "levvy_app",
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = main_mod,
     });
 
     const run_cmd = b.addRunArtifact(exe);

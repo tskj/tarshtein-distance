@@ -7,7 +7,7 @@ const streak_bias: u16 = 3;
 
 const case_setting = 1;
 
-export fn fuzzy_search(query: [*:0]const u8, number_of_lines: c_uint, input: [*]const [*:0]const u8, output: [*]u16) callconv(.C) c_int {
+export fn fuzzy_search(query: [*:0]const u8, number_of_lines: c_uint, input: [*]const [*:0]const u8, output: [*]u16) callconv(.c) c_int {
     const q_len: u16 = @as(u16, @intCast(std.mem.len(query)));
 
     var longest_line_length: u16 = 0;
@@ -114,10 +114,10 @@ fn compute_distance(q: [*]const u8, q_len: u16, h: [*]const u8, h_len: u16, padd
 }
 
 test "simple test" {
-    var list = std.ArrayList(i32).init(std.testing.allocator);
-    defer list.deinit(); // try commenting this out and see if zig detects the memory leak!
-    try list.append(42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
+    var list: std.ArrayList(i32) = .empty;
+    defer list.deinit(std.testing.allocator); // try commenting this out and see if zig detects the memory leak!
+    try list.append(std.testing.allocator, 42);
+    try std.testing.expectEqual(@as(i32, 42), list.pop().?);
 }
 
 test "fuzzy_search simple test" {
